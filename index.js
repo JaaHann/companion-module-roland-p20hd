@@ -15,54 +15,39 @@ class p20hdInstance extends InstanceBase {
 		this.pollTimer = undefined
 
 		this.lastReturnedCommand = ''
+		
+		this.auth = {
+			sendUserId: false,
+			sendPassword: false,
+			accepted: false
+		}
 
 		this.data = {
-			open_project: '',
-			recording_status: '',
-			playback_status: '',
+			project_open: false,
+			recording: false,
+			playing: false,
+			playback_speed: 0,
+			set_playback_speed: 0,
 			playback_range: '',
-			in_point_status: '',
+			in_point: false,
+			out_point: false,
+			audio_level: -80.1,
+			in_config: 1,
+			out_config: 0,
+			selected_playlist: -1,
+			selected_playlist_length: 0,
+			selected_number: -1,
+			cued_playlist: -1,
+			cued_number: -1,
 		}
 
-		this.CHOICES_SHUTTLE_SPEEDS = [
-			{ id: '-8', label: 'x-128'},
-			{ id: '-7', label: 'x-64'},
-			{ id: '-6', label: 'x-32'},
-			{ id: '-5', label: 'x-16'},
-			{ id: '-4', label: 'x-8'},
-			{ id: '-3', label: 'x-4'},
-			{ id: '-2', label: 'x-2'},
-			{ id: '-1', label: 'x-1'},
-			{ id: '0', label: 'x0'},
-			{ id: '1', label: 'x1'},
-			{ id: '2', label: 'x2'},
-			{ id: '3', label: 'x4'},
-			{ id: '4', label: 'x8'},
-			{ id: '5', label: 'x16'},
-			{ id: '6', label: 'x32'},
-			{ id: '7', label: 'x64'},
-			{ id: '8', label: 'x128'},
-		]
+		this.pollCommands = ['QPJ', 'QMD', 'QRC', 'QPL', 'QSP', 'QSR', 'QMI', 'QIS', 'QOS', 'QAL', 'QPS', 'QCS', 'QPQ', 'QCQ', 'QNC']
 
-		this.CHOICES_CLIP_LIST = [];
-
-		for (let i = 1; i <= 512; i++) {
-			this.CHOICES_CLIP_LIST.push({
-				id: i.toString(),
-				label: 'Clip ' + i
-			});
-		}
-
-		for (let i = 1; i <= 64; i++) {
-			this.CHOICES_CLIP_LIST.push({
-				id: i.toString(),
-				label: 'Palette ' + i
-			});
-		}
 	}
 
 	async destroy() {
 		if (this.socket !== undefined) {
+			this.sendCommand('QIT') //close socket
 			this.socket.destroy()
 		}
 
@@ -124,56 +109,106 @@ class p20hdInstance extends InstanceBase {
 
 			this.socket.on('connect', () => {
 				this.cmdPipe = []
-
-				this.sendCommmand('VER') //just request version one time
-
-				this.initPolling()
-
-				this.updateStatus('ok')
+				this.initLoginUser();
 			})
 
 			this.socket.on('data', (receivebuffer) => {
-				pipeline += receivebuffer.toString('utf8')
+				pipeline = receivebuffer.toString('utf8')
 
-				// ACKs are sent at the end of the stream result, we should have 1 command to 1 ack
-				if (pipeline.includes(this.CONTROL_ACK)) {
-					this.lastReturnedCommand = this.cmdPipeNext()
-					if (pipeline.length == 1) pipeline = ''
-				}
+				// Every response will end with ACK, NACK or ';'
 
-				// Every command ends with ; and an ACK or an ACK if nothing needed; `VER` is the only command that won't return an ACK, which we do not use
-				if (pipeline.includes(';')) {
-					// multiple rapid Query strings can result in async multiple responses so split response into individual messages
-					// however, the documentation for the V-60 says NOT to send more than 1 command before receiving the ACK from the last one,
-					// so we should always have one at a time
-					let allresponses = pipeline.split(';')
-					// last element will either be a partial response, an <ack> (processed next timer tick), or an empty string from split where a complete pipeline ends with ';'
-					pipeline = allresponses.pop()
-					for (let response of allresponses) {
-						response = response.replace(new RegExp(this.CONTROL_ACK, 'g'), '')
+				if (pipeline.includes(this.CONTROL_NACK)) { // When NACK is received
+					this.log('error', `Command ${this.lastReturnedCommand} was not accepted by the device`)
+					if (this.lastReturnedCommand.indexOf('PSS') > -1) {
+						this.log('error', `The password was probably wrong`);
+					}
 
-						if (response.length > 0) {
-							this.processResponse(response)
-						}
+					if (this.socket !== undefined) {
+						this.sendCommand('QIT') //close socket
+						this.socket.destroy()
+					}
+			
+					if (this.pollTimer !== undefined) {
+						clearInterval(this.pollTimer)
+						delete this.pollTimer
 					}
 				}
+				else if (pipeline.includes(this.CONTROL_ACK)) { // When ACK is received
+					if (this.auth.sendUserId && !this.auth.accepted) { //if the last command was the username command, send the password
+						this.initLoginPassword();
+						this.sendCommand('VER');
+					}
+				}
+				else if (pipeline.includes('VER') && this.auth.sendPassword && !this.auth.accepted) { //if the pipeline contains the version string, the password command was send and authentication is not accepted, we are now accepted
+					this.auth.accepted = true
+					console.log("User ID and Password Accepted")
+					this.initCommunication();
+				}
+
+				this.lastReturnedCommand = this.cmdPipeNext() //returns the last command and runs the next one
+
+				if (pipeline.length == 1) pipeline = ''
+				
+				if (pipeline.includes(';')) { // We already processed ACK and NACK, so if there are any commands left, they will end with ;
+					let allResponses = pipeline.split(';'); // If multiple commands are received, we can split the pipeline to get individual commands
+
+					allResponses.forEach((response) => {
+						if (response.length > 0 && response.includes(':')) {
+							this.processResponse(response)
+						}
+					});
+				}
+							
 			})
 		}
 	}
 
 	cmdPipeNext() {
-		const return_cmd = this.cmdPipe.shift()
+		let return_cmd;
+		if (this.cmdPipe.length > 0) {
+			return_cmd = this.cmdPipe.shift()
+		}
 
 		if(this.cmdPipe.length > 0) {
 			this.socket.send(this.CONTROL_STX + this.cmdPipe[0] + ';')
+			
+			if (this.cmdPipe[0].includes('PSS:')) {
+				console.log(this.cmdPipe)
+				return_cmd = this.cmdPipe.shift()
+				console.log(this.cmdPipe)
+
+				if(this.cmdPipe.length > 0) {
+					this.socket.send(this.CONTROL_STX + this.cmdPipe[0] + ';')
+				}
+			}
 		}
 
 		return return_cmd
 	}
 
+	initLoginUser() {
+		this.auth.sendUserId = true
+		this.sendCommand(`USR:${this.config.userId}`); //send username
+	}
+
+	initLoginPassword() {
+		this.auth.sendPassword = true
+		this.sendCommand(`PSS:${this.config.password}`); //send password
+	}
+
+	initCommunication() {
+		if (this.communicationInitiated !== true) {
+			this.initPolling()
+			this.updateStatus('ok')
+
+			this.communicationInitiated = true;
+		}		
+	}
+
 	processResponse(response) {
-		let category = 'XXX'
-		let args = []
+		response = response.split(':')
+		let category = response[0].slice(1)
+		let args = response[1].split(',')
 
 		const errorMessage = (errcode) => {
 			let errstring = ''
@@ -194,12 +229,6 @@ class p20hdInstance extends InstanceBase {
 			this.log('error', 'ERR: ' + errstring + ' - Command = ' + this.lastReturnedCommand)
 		}
  
-		let settingseparator = response.search(':')
-		if (settingseparator > 2) {
-			category = response.substring(settingseparator - 3, settingseparator)
-			let argstring = response.substring(settingseparator + 1, response.length) // from start of params to end of string
-			args = argstring.split(',')
-		} 
 		switch (category) {
 			case 'VER': //version
 				this.setVariableValues({
@@ -208,9 +237,9 @@ class p20hdInstance extends InstanceBase {
 				})
 				break
 			case 'QPJ': //check for open project
-				this.data.open_project = parseInt(args[0])
+				this.data.project_open = parseInt(args[0]) == 1 ? true : false
 				this.setVariableValues({
-					open_project: parseInt(args[0]) == 1 ? 'True' : 'False'
+					project_open: this.data.project_open
 				})
 				break
 			case 'QMD': //get project recording/playback mode
@@ -219,36 +248,48 @@ class p20hdInstance extends InstanceBase {
 				})
 				break
 			case 'QRC': //get recording status
-			this.data.playback_status = parseInt(args[0])
+				this.data.recording = parseInt(args[0]) == 1 ? true : false
 				this.setVariableValues({
-					recording_status: parseInt(args[0]) == 1 ? 'Recording' : 'Stopped'
+					recording: this.data.recording
 				})
+				if (this.data.recording) {
+					this.setVariableValues({
+						// recording_label: '&#9209;'
+						recording_label: 'Stop'
+					})
+				}
+				else {
+					this.setVariableValues({
+						// recording_label: '&#9210;'
+						recording_label: 'Rec'
+					})
+				}
 				break
 			case 'QPL': //get playback status
-				let playbackArg = parseInt(args[0])
-				this.data.playback_status = playbackArg
-				let playbackStatus = ''
-				
-				if (playbackArg == 0) {
-					playbackStatus = 'Playback Paused'
+				let playing = parseInt(args[0]) == 0 ? false : true
+				if (!playing && this.data.playing) {
 				}
-				else if (playbackArg == 1) {
-					playbackStatus = 'Playing Back'
-				}
-				else if (playbackArg == 2) {
-					playbackStatus = 'Playing Back Clip'
-				}
-				else if (playbackArg == 3) {
-					playbackStatus = 'Playing Back Playlist'
-				}
-
+				this.data.playing = parseInt(args[0]) == 0 ? false : true
 				this.setVariableValues({
-					playback_status: playbackStatus
+					playing: this.data.playing
 				})
+				if (this.data.playing) {
+					this.setVariableValues({
+						// playing_label: '&#9208;'
+						playing_label: 'Pause'
+					})
+				}
+				else {
+					this.setVariableValues({
+						// playing_label: '&#9205;'
+						playing_label: 'Play'
+					})
+				}
 				break
 			case 'QSP': //get playback speed
+			this.data.playback_speed = parseInt(args[0])
 				this.setVariableValues({
-					playback_speed: parseInt(args[0])
+					playback_speed: this.data.playback_speed
 				})
 				break
 			case 'QSR': //get playback range
@@ -258,25 +299,25 @@ class p20hdInstance extends InstanceBase {
 				})
 				break
 			case 'QMI': //get in point status
-				this.data.in_point_status = parseInt(args[0])
+				this.data.in_point = parseInt(args[0]) == 1 ? true : false
 				this.setVariableValues({
-					in_point_status: parseInt(args[0]) == 1 ? 'Set' : 'Not Set'
+					in_point: this.data.in_point
 				})
 				break
 			case 'QIS': //get input selection status
-				let inputStatusArg = parseInt(args[0])
+				this.data.in_config = parseInt(args[0])
 				let inputStatus = ''
 				
-				if (inputStatusArg == 1) {
+				if (this.data.in_config == 1) {
 					inputStatus = 'Live In 1'
 				}
-				else if (inputStatusArg == 2) {
+				else if (this.data.in_config == 2) {
 					inputStatus = 'Live In 2'
 				}
-				else if (inputStatusArg == 3) {
+				else if (this.data.in_config == 3) {
 					inputStatus = 'PinP'
 				}
-				else if (inputStatusArg == 4) {
+				else if (this.data.in_config == 4) {
 					inputStatus = 'Split'
 				}
 
@@ -285,60 +326,61 @@ class p20hdInstance extends InstanceBase {
 				})
 				break
 			case 'QOS': //get output selection status
+			this.data.out_config = parseInt(args[0])
 				this.setVariableValues({
-					output_selection_status: parseInt(args[0]) == 1 ? 'Live In Video' : 'Replay Video'
+					output_selection_status: this.data.out_config == 1 ? 'Live' : 'Replay'
 				})
 				break
 			case 'QAL': //get audio level
-				let audioLevelArg = parseInt(args[0])
-				let audioLevel = ''
-				if (audioLevelArg == 801) {
-					audioLevel = '-INF dB'
+				this.data.audio_level = parseInt(args[0]) / 10
+				if (this.data.audio_level == -80.1) {
+					this.setVariableValues({
+						audio_level: '-INF'
+					})
 				}
 				else {
-					audioLevel = audioLevelArg / 10 + 'dB'
+					this.setVariableValues({
+						audio_level: this.data.audio_level
+					})
 				}
 
-				this.setVariableValues({
-					audio_level: audioLevel
-				})
 				break
 			case 'QPS': //get playlist containing currently selected clip
-				let playlistArg = parseInt(args[0])
-				let playlist = ''
-				if (playlistArg == 0) {
-					playlist = 'Clip List'
+				this.data.selected_playlist = parseInt(args[0])
+				if (this.data.selected_playlist == 0) {
+					this.setVariableValues({
+						selected_clip_playlist: 'Clip List'
+					})
 				}
 				else {
-					playlist = 'Palette ' + playlistArg
+					this.setVariableValues({
+						selected_clip_playlist: 'Palette ' + this.data.selected_playlist
+					})
 				}
-
-				this.setVariableValues({
-					playlist_selected_clip: playlist
-				})
 				break
 			case 'QCS': //get number of currently selected clip
+				this.data.selected_number = parseInt(args[0])
 				this.setVariableValues({
-					playlist_selected_clip_number: parseInt(args[0])
+					selected_clip_number: this.data.selected_number
 				})
 				break
 			case 'QPQ': //get playlist containing cued-up clip
-				let playlistQArg = parseInt(args[0])
-				let playlistQ = ''
-				if (playlistQArg == 0) {
-					playlistQ = 'Clip List'
+				this.data.cued_playlist = parseInt(args[0])
+				if (this.data.cued_playlist == 0) {
+					this.setVariableValues({
+						cued_clip_playlist: 'Clip List'
+					})
 				}
 				else {
-					playlistQ = 'Palette ' + playlistQArg
+					this.setVariableValues({
+						cued_clip_playlist: 'Palette ' + this.data.cued_playlist
+					})
 				}
-
-				this.setVariableValues({
-					playlist_queued_clip: playlist
-				})
 				break
 			case 'QCQ': //get number of currently queued clip
+				this.data.cued_number = parseInt(args[0])
 				this.setVariableValues({
-					playlist_queued_clip_number: parseInt(args[0])
+					cued_clip_number: this.data.cued_number
 				})
 				break
 			case 'QCX':
@@ -351,16 +393,19 @@ class p20hdInstance extends InstanceBase {
 				
 				break
 			case 'QNC':
-				
+				this.data.selected_playlist_length = parseInt(args[0])
+				this.setVariableValues({
+					selected_clip_playlist_length: this.data.selected_playlist_length
+				})
 				break
 			case 'ERR':
-				errorMessage(args[0])
+				// errorMessage(args[0])
 			break
 		}
 
 		this.checkFeedbacks()
 	}
-	sendCommmand(cmd) {
+	sendCommand(cmd) {
 		if (cmd !== undefined) {
 			if (this.socket !== undefined && this.socket.isConnected) {
 				this.cmdPipe.push(cmd)
@@ -376,34 +421,35 @@ class p20hdInstance extends InstanceBase {
 	}
 
 	initPolling() {
-		if (this.pollTimer === undefined && this.config.poll_interval > 0) {
+		if (this.pollTimer === undefined && this.config.pollInterval > 0) {
 			this.pollTimer = setInterval(() => {
-				this.sendPollCommand('QPJ');
-				this.sendPollCommand('QMD');
-				this.sendPollCommand('QRC');
-				this.sendPollCommand('QPL');
-				this.sendPollCommand('QSP');
-				this.sendPollCommand('QSR');
-				this.sendPollCommand('QMI');
-				this.sendPollCommand('QIS');
-				this.sendPollCommand('QOS');
-				this.sendPollCommand('QAL');
-				this.sendPollCommand('QPS');
-				this.sendPollCommand('QCS');
-				this.sendPollCommand('QPQ');
-				this.sendPollCommand('QCQ');
-				this.sendPollCommand('QCX');
-				this.sendPollCommand('QAX');
-				this.sendPollCommand('QSX');
-				this.sendPollCommand('QNC');
-			}, this.config.poll_interval)
+				this.sendPollCommands(this.pollCommands)
+			}, this.config.pollInterval)
 		}
 	}
 
-	sendPollCommand(cmd) {
+	sendPollCommands(pollCmds=[]) {
 		if (this.socket !== undefined && this.socket.isConnected) {
-			if(!this.cmdPipe.includes(cmd)) { // No need to flood the buffer with these
-				this.sendCommmand(cmd)
+			let cmdStr;
+			pollCmds.forEach((cmd) => {
+				if (cmd == 'QNC' && this.data.selected_playlist >= 0 && this.data.selected_playlist <= 8) { //catch QNC command to add parameter
+					cmd = cmd + ':' + this.data.selected_playlist
+				}
+				else if (cmd == 'QNC') {
+					return
+				}
+				if (cmdStr == undefined) {
+					cmdStr = this.CONTROL_STX + cmd + ';';
+				}
+				else {
+					cmdStr = cmdStr + this.CONTROL_STX + cmd + ';'; // chain all poll commands together to only make a single request for all
+				}
+			});
+			if (pollCmds.length > 0) {
+				this.socket.send(cmdStr);
+			}
+			else {
+				console.log('No commands for polling!')
 			}
 		}
 	}
@@ -422,89 +468,161 @@ class p20hdInstance extends InstanceBase {
 				id: 'host',
 				label: 'IP Address',
 				width: 6,
-				default: '192.168.0.1',
+				default: '169.254.9.184',
 				regex: Regex.IP,
 			},
 			{
 				type: 'number',
-				id: 'poll_interval',
+				id: 'pollInterval',
 				label: 'Polling Interval (ms), set to 0 to disable polling',
 				min: 50,
-				max: 30000,
-				default: 1000,
+				max: 1000,
+				default: 100,
 				width: 3,
-			}
+			},
+			{
+				type: 'textinput',
+				id: 'userId',
+				label: 'User ID',
+				width: 6,
+				default: 'AAAA',
+			},
+			{
+				type: 'textinput',
+				id: 'password',
+				label: 'Password',
+				width: 6,
+				default: 'AAAAAAAA',
+			},
 		]
 	}
 
 	initActions() {
 		let actions = {
-			rec_start: {
-				name: 'Start Recording',
-				options: [
-				],
-				callback: async (event) => {
-					this.sendCommmand('REC')
-				},
-			},
-			rec_stop: {
-				name: 'Stop Recording',
-				options: [
-				],
-				callback: async (event) => {
-					this.sendCommmand('RES')
-				},
-			},
-			playback_start: {
-				name: 'Start Playback',
-				options: [
-				],
-				callback: async (event) => {
-					this.sendCommmand('PLY')
-				},
-			},
-			playback_pause: {
-				name: 'Pause Playback',
-				options: [
-				],
-				callback: async (event) => {
-					this.sendCommmand('PUS')
-				},
-			},
-			jog_forward: {
-				name: 'Jog Forward',
-				options: [
-				],
-				callback: async (event) => {
-					this.sendCommmand('JOG:1')
-				},
-			},
-			jog_reverse: {
-				name: 'Jog Reverse',
-				options: [
-				],
-				callback: async (event) => {
-					this.sendCommmand('JOG:-1')
-				},
-			},
-			shuttle: {
-				name: 'Set Shuttle Speed',
+			recording: {
+				name: 'Start/Stop Recording',
 				options: [
 					{
 						type: 'dropdown',
-						label: 'Shuttle Speed',
-						id: 'speed',
-						default: '0',
-						choices: this.CHOICES_SHUTTLE_SPEEDS
+						label: 'Mode',
+						id: 'mode',
+						default: 'TOG',
+						choices: [
+							{'id': 'TOG', 'label': 'Toggle'},
+							{'id': 'REC', 'label': 'Start'},
+							{'id': 'RES', 'label': 'Stop'}
+						]
 					},
 				],
 				callback: async (event) => {
-					this.sendCommmand('SHT:' + event.options.speed)
+					if (event.options.mode == 'TOG') {
+						if (this.data.recording) {
+							this.sendCommand('RES')
+						}
+						else {
+							this.sendCommand('REC')
+						}
+					}
+					else {
+						this.sendCommand(event.options.mode)
+					}
+				},
+			},
+			playback: {
+				name: 'Play/Pause',
+				options: [
+					{
+						type: 'dropdown',
+						label: 'Mode',
+						id: 'mode',
+						default: 'TOG',
+						choices: [
+							{'id': 'TOG', 'label': 'Toggle'},
+							{'id': 'PLY', 'label': 'Play'},
+							{'id': 'PUS', 'label': 'Pause'}
+						]
+					}
+				],
+				callback: async (event) => {
+					if (event.options.mode == 'TOG') {
+						if (this.data.playing) {
+							this.sendCommand('PUS')
+						}
+						else {
+							this.sendCommand('PLY')
+						}
+					}
+					else {
+						this.sendCommand(event.options.mode)
+					}
+				}, 
+			},
+			jog: {
+				name: 'Jog',
+				options: [
+					{
+						type: 'dropdown',
+						label: 'Direction',
+						id: 'direction',
+						default: 1,
+						choices: [
+							{id: 1, label: 'Forward'},
+							{id: -1, label: 'Reverse'}
+						]
+					}
+				],
+				callback: async (event) => {
+					this.sendCommand('JOG:' + event.options.direction)
+				},
+			},
+			shuttle: {
+				name: 'Shuttle',
+				options: [
+					{
+						type: 'dropdown',
+						label: 'Direction',
+						id: 'direction',
+						default: 'for',
+						choices: [
+							{id: 'for', label: 'Forward'},
+							{id: 'rev', label: 'Reverse'}
+						]
+					},
+					{
+						type: 'dropdown',
+						label: 'Speed',
+						id: 'speed',
+						default: 1,
+						choices: [
+							{ id: 1, label: 'x1'},
+							{ id: 2, label: 'x2'},
+							{ id: 3, label: 'x4'},
+							{ id: 4, label: 'x8'},
+							{ id: 5, label: 'x16'},
+							{ id: 6, label: 'x32'},
+							{ id: 7, label: 'x64'},
+							{ id: 8, label: 'x128'},
+						]
+					},
+				],
+				callback: async (event) => {
+					this.sendCommand('SHT:' + event.options.direction.replace('for', '').replace('rev', '-') + event.options.speed)
 				},
 			},
 			playback_speed: {
-				name: 'Change Playback Speed',
+				name: 'Playback Speed',
 				options: [
+					{
+						id: 'mode',
+						type: 'dropdown',
+						label: 'Mode',
+						default: 'set',
+						choices: [
+							{id: 'set', label: 'Set'},
+							{id: 'inc', label: 'Increase'},
+							{id: 'dec', label: 'Decrease'}
+						]
+					},
 					{
 						id: 'speed',
 						type: 'number',
@@ -512,64 +630,92 @@ class p20hdInstance extends InstanceBase {
 						default: 100,
 						min: 0,
 						max: 100
+					},
+					{
+						id: 'play',
+						type: 'checkbox',
+						label: 'Try auto play',
+						default: false,
+					},
+					{
+						id: 'limit',
+						type: 'checkbox',
+						label: 'Limit to max 99% to prevent output lag',
+						default: false,
 					}
 				],
 				callback: async (event) => {
-					this.sendCommmand('SPC:' + event.options.speed)
-				},
+					let newSpeed = event.options.speed
+					if (event.options.mode == 'inc') {
+						newSpeed += this.data.playback_speed
+						if (newSpeed > 100) {
+							newSpeed = 100
+						}
+					}
+					else  if (event.options.mode == 'dec') {
+						newSpeed = this.data.playback_speed - newSpeed
+						if (newSpeed < 0) {
+							newSpeed = 0
+						}
+					}
+					else if (event.options.play && !this.data.playing) {
+						this.data.set_playback_speed = 0
+						this.sendCommand('SPC:0')
+					}
+					if (event.options.limit && newSpeed > 99) {
+						newSpeed = 99
+					}
+					if (event.options.speed == this.data.set_playback_speed) {
+						this.sendCommand('SPC:' + (newSpeed - 1))
+					}
+					this.data.set_playback_speed = newSpeed
+					this.sendCommand('SPC:' + newSpeed)
+				}
 			},
 			speed_range: {
-				name: 'Switch Playback Speed Range',
+				name: 'Speed Range ON/OFF',
 				options: [
 					{
 						type: 'dropdown',
-						label: 'Button State',
+						label: 'State',
 						id: 'state',
 						default: '0',
 						choices: [
-							{ id: '0',  label: '[SPEED RANGE] button is unlit'},
-							{ id: '1',  label: '[SPEED RANGE] button is lit'}
+							{ id: '0',  label: 'ON'},
+							{ id: '1',  label: 'OFF'}
 						]
 					},
 				],
 				callback: async (event) => {
-					this.sendCommmand('SPR:' + event.options.state)
+					this.sendCommand('SPR:' + event.options.state)
 				},
 			},
-			in_point_settings: {
-				name: 'IN Point Settings',
+			keyframes: {
+				name: 'Set IN/OUT Point',
 				options: [
 					{
 						type: 'dropdown',
-						label: 'Setting',
-						id: 'setting',
-						default: '0',
+						label: 'Type',
+						id: 'type',
+						default: 'MIN',
 						choices: [
-							{ id: '0',  label: 'Replay Video'},
-							{ id: '1',  label: 'Live In Video'}
+							{ id: 'MIN',  label: 'IN Point'},
+							{ id: 'MOT',  label: 'OUT Point'}
 						]
 					},
-				],
-				callback: async (event) => {
-					this.sendCommmand('MIN:' + event.options.setting)
-				},
-			},
-			out_point_settings: {
-				name: 'OUT Point Settings',
-				options: [
 					{
 						type: 'dropdown',
-						label: 'Setting',
-						id: 'setting',
+						label: 'Source',
+						id: 'source',
 						default: '0',
 						choices: [
-							{ id: '0',  label: 'Replay Video'},
-							{ id: '1',  label: 'Live In Video'}
+							{ id: '0',  label: 'Replay'},
+							{ id: '1',  label: 'Live'}
 						]
 					},
 				],
 				callback: async (event) => {
-					this.sendCommmand('MOT:' + event.options.setting)
+					this.sendCommand(event.options.type + ':' + event.options.source)
 				},
 			},
 			clip_create: {
@@ -579,30 +725,52 @@ class p20hdInstance extends InstanceBase {
 						type: 'dropdown',
 						label: 'Setting',
 						id: 'setting',
-						default: '0',
+						default: -1,
 						choices: [
-							{ id: '0',  label: 'Replay Video'},
-							{ id: '1',  label: 'Live In Video'}
+							{id: -1, label: 'From Selected Output'},
+							{id: 0, label: 'From Replay'},
+							{id: 1, label: 'From Live'}
 						]
 					},
 				],
 				callback: async (event) => {
-					this.sendCommmand('MCL:' + event.options.setting)
+					let setting = event.options.setting
+					if (setting == -1) {
+						setting = this.data.out_config
+					}
+					this.sendCommand('MCL:' + setting)
 				},
 			},
-			clip_select: {
-				name: 'Select Clip',
+			clip_actions: {
+				name: 'Clip Actions',
 				options: [
 					{
 						type: 'dropdown',
-						label: 'Clip/Palette',
-						id: 'clip',
-						default: '1',
-						choices: this.CHOICES_CLIP_LIST
+						label: 'Action',
+						id: 'action',
+						default: 'CLS',
+						choices: [
+							{id: 'CLS', label: 'Select'},
+							{id: 'CLQ', label: 'Cue Up'},
+							{id: 'CLD', label: 'Delete'},
+						]
+					},
+					{
+						type: 'number',
+						label: 'Number (0 = selected clip)',
+						id: 'number',
+						default: 1,
+						min: 0,
+						max: 512,
 					},
 				],
 				callback: async (event) => {
-					this.sendCommmand('CLS:' + event.options.setting)
+					if (event.options.number == 0) {
+						this.sendCommand(event.options.action + ':' + this.data.selected_number)
+					}
+					else {
+						this.sendCommand(event.options.action + ':' + event.options.number)
+					}
 				},
 			},
 			clip_playback_start: {
@@ -610,63 +778,40 @@ class p20hdInstance extends InstanceBase {
 				options: [
 				],
 				callback: async (event) => {
-					this.sendCommmand('APC')
+					this.sendCommand('APC')
 				},
 			},
-			clip_cue: {
-				name: 'Cue Clip',
+			bookmarks: {
+				name: 'Create/Delete Bookmarks',
 				options: [
 					{
 						type: 'dropdown',
-						label: 'Clip/Palette',
-						id: 'clip',
-						default: '1',
-						choices: this.CHOICES_CLIP_LIST
-					},
-				],
-				callback: async (event) => {
-					this.sendCommmand('CLQ:' + event.options.setting)
-				},
-			},
-			clip_delete: {
-				name: 'Delete Clip',
-				options: [
-					{
-						type: 'dropdown',
-						label: 'Clip/Palette',
-						id: 'clip',
-						default: '1',
-						choices: this.CHOICES_CLIP_LIST
-					},
-				],
-				callback: async (event) => {
-					this.sendCommmand('CLD:' + event.options.setting)
-				},
-			},
-			bookmark_set: {
-				name: 'Set Bookmark',
-				options: [
-					{
-						type: 'dropdown',
-						label: 'Setting',
-						id: 'setting',
-						default: '0',
+						label: 'Action',
+						id: 'action',
+						default: 0,
 						choices: [
-							{ id: '0',  label: 'Replay Video'},
-							{ id: '1',  label: 'Live In Video'}
+							{id: 0, label: 'Set New Bookmark'},
+							{id: 1, label: 'Delete Bookmark'}
+						]
+					},
+					{
+						type: 'dropdown',
+						label: 'Timeline (only necessary if Action = "Set New Bookmark")',
+						id: 'timeline',
+						default: 0,
+						choices: [
+							{id: 0, label: 'Replay'},
+							{id: 1, label: 'Live'}
 						]
 					},
 				],
 				callback: async (event) => {
-					this.sendCommmand('BMK:' + event.options.setting)
-				},
-			},
-			bookmark_delete: {
-				name: 'Delete Bookmark',
-				options: [
-				],
-				callback: async (event) => {
-					this.sendCommmand('DMK')
+					if (event.options.action == 0) {
+						this.sendCommand('BMK:' + event.options.timeline)
+					}
+					else {
+						this.sendCommand('DMK')
+					}
 				},
 			},
 			switch_input: {
@@ -676,17 +821,17 @@ class p20hdInstance extends InstanceBase {
 						type: 'dropdown',
 						label: 'Setting',
 						id: 'setting',
-						default: '1',
+						default: 1,
 						choices: [
-							{ id: '1',  label: 'Live In 1'},
-							{ id: '2',  label: 'Live In 2'},
-							{ id: '3',  label: 'PnP'},
-							{ id: '4',  label: 'Split'}
+							{ id: 1,  label: 'Live 1'},
+							{ id: 2,  label: 'Live 2'},
+							{ id: 3,  label: 'PinP'},
+							{ id: 4,  label: 'Split'}
 						]
 					},
 				],
 				callback: async (event) => {
-					this.sendCommmand('SLI:' + event.options.setting)
+					this.sendCommand('SLI:' + event.options.setting)
 				},
 			},
 			switch_output: {
@@ -696,48 +841,36 @@ class p20hdInstance extends InstanceBase {
 						type: 'dropdown',
 						label: 'Setting',
 						id: 'setting',
-						default: '0',
+						default: 0,
 						choices: [
-							{ id: '0',  label: 'Replay Video'},
-							{ id: '1',  label: 'Live In Video'}
+							{id: 0,  label: 'Replay'},
+							{id: 1,  label: 'Live'}
 						]
 					},
 				],
 				callback: async (event) => {
-					this.sendCommmand('SLO:' + event.options.setting)
+					this.sendCommand('SLO:' + event.options.setting)
 				},
 			},
-			bookmark_next: {
-				name: 'Jump to Next Bookmark',
+			timeline: {
+				name: 'Jump to Markers in Timeline',
 				options: [
+					{
+						type: 'dropdown',
+						label: 'Setting',
+						id: 'setting',
+						default: 'JNB',
+						choices: [
+							{id: 'JNB', label: 'Next Bookmark'},
+							{id: 'JPB', label: 'Previous Bookmark'},
+							{id: 'JTP', label: 'Beginning'},
+							{id: 'JED', label: 'End'},
+						]
+					}
 				],
-				callback: async (event) => {
-					this.sendCommmand('JNB')
-				},
-			},
-			bookmark_previous: {
-				name: 'Jump to Previous Bookmark',
-				options: [
-				],
-				callback: async (event) => {
-					this.sendCommmand('JPB')
-				},
-			},
-			timeline_beginning: {
-				name: 'Jump to Beginning of Timeline',
-				options: [
-				],
-				callback: async (event) => {
-					this.sendCommmand('JTP')
-				},
-			},
-			timeline_end: {
-				name: 'Jump to End of Timeline',
-				options: [
-				],
-				callback: async (event) => {
-					this.sendCommmand('JED')
-				},
+				callback: (event) => {
+					this.sendCommand(event.options.setting)
+				}
 			},
 			playlist_select: {
 				name: 'Select Playlist',
@@ -761,7 +894,7 @@ class p20hdInstance extends InstanceBase {
 					},
 				],
 				callback: async (event) => {
-					this.sendCommmand('PLS:' + event.options.setting)
+					this.sendCommand('PLS:' + event.options.setting)
 				},
 			},
 			playlist_playback_start: {
@@ -769,7 +902,7 @@ class p20hdInstance extends InstanceBase {
 				options: [
 				],
 				callback: async (event) => {
-					this.sendCommmand('APL')
+					this.sendCommand('APL')
 				},
 			},
 			playlist_stop: {
@@ -777,7 +910,7 @@ class p20hdInstance extends InstanceBase {
 				options: [
 				],
 				callback: async (event) => {
-					this.sendCommmand('SAP')
+					this.sendCommand('SAP')
 				},
 			},
 			palette_select: {
@@ -801,7 +934,7 @@ class p20hdInstance extends InstanceBase {
 					},
 				],
 				callback: async (event) => {
-					this.sendCommmand('PLS:' + event.options.palette) //this command is probably wrong, but it's what the manual says
+					this.sendCommand('PLS:' + event.options.palette) //this command is probably wrong, but it's what the manual says
 				},
 			},
 			palette_select: {
@@ -825,7 +958,7 @@ class p20hdInstance extends InstanceBase {
 					},
 				],
 				callback: async (event) => {
-					this.sendCommmand('ATP:' + event.options.palette)
+					this.sendCommand('ATP:' + event.options.palette)
 				},
 			},
 			stillimage_playback: {
@@ -857,7 +990,7 @@ class p20hdInstance extends InstanceBase {
 					},
 				],
 				callback: async (event) => {
-					this.sendCommmand('STP:' + event.options.still)
+					this.sendCommand('STP:' + event.options.still)
 				},
 			},
 			stillimage_stop: {
@@ -865,7 +998,7 @@ class p20hdInstance extends InstanceBase {
 				options: [
 				],
 				callback: async (event) => {
-					this.sendCommmand('STS')
+					this.sendCommand('STS')
 				},
 			},
 			audioclips_playback: {
@@ -897,7 +1030,7 @@ class p20hdInstance extends InstanceBase {
 					},
 				],
 				callback: async (event) => {
-					this.sendCommmand('AUP:' + event.options.clip)
+					this.sendCommand('AUP:' + event.options.clip)
 				},
 			},
 			audioclips_stop: {
@@ -905,24 +1038,48 @@ class p20hdInstance extends InstanceBase {
 				options: [
 				],
 				callback: async (event) => {
-					this.sendCommmand('AUS')
+					this.sendCommand('AUS')
 				},
 			},
 			audio_level: {
-				name: 'Set Audio Level',
+				name: 'Audio Level',
 				options: [
+					{
+						id: 'mode',
+						type: 'dropdown',
+						label: 'Mode',
+						default: 'set',
+						choices: [
+							{id: 'set', label: 'Set'},
+							{id: 'inc', label: 'Increase'},
+							{id: 'dec', label: 'Decrease'}
+						]
+					},
 					{
 						id: 'level',
 						type: 'number',
-						label: 'Audio Level',
-						default: 0,
-						min: -80,
-						max: 10,
+						label: 'Audio Level (-INF = -80.1)',
+						default: 0.0,
+						min: -80.1,
+						max: 90.1,
 						steps: 0.1
 					}
 				],
 				callback: async (event) => {
-					this.sendCommmand('VOL:' + (event.options.level * 10))
+					let newLevel = this.data.audio_level
+					if (event.options.mode == 'inc') {
+						newLevel += event.options.level
+					}
+					else if (event.options.mode == 'dec') {
+						newLevel -= event.options.level
+					}
+					if (newLevel > 10.0) {
+						newLevel = 10.0
+					}
+					else if (newLevel < -80.1) {
+						newLevel = -80.1
+					}
+					this.sendCommand('VOL:' + newLevel * 10)
 				},
 			},
 			active_sensing: {
@@ -930,7 +1087,7 @@ class p20hdInstance extends InstanceBase {
 				options: [
 				],
 				callback: async (event) => {
-					this.sendCommmand('ACS')
+					this.sendCommand('ACS')
 				},
 			},
 			shutdown: {
@@ -938,7 +1095,7 @@ class p20hdInstance extends InstanceBase {
 				options: [
 				],
 				callback: async (event) => {
-					this.sendCommmand('EXT')
+					this.sendCommand('EXT')
 				},
 			},
 		}
@@ -946,113 +1103,304 @@ class p20hdInstance extends InstanceBase {
 	}
 
 	initFeedbacks() {
-		let feedbacks = {}
-
-		feedbacks['open_project'] = {
-			type: 'boolean',
-			name: 'Unit has an Open Project',
-			description: 'Show feedback for Open Project state',
-			options: [
-			],
-			defaultStyle: {
-				color: combineRgb(0, 0, 0),
-				bgcolor: combineRgb(255, 0, 0)
-			},
-			callback: async (event) => {
-				let opt = await event.options
-				if (this.data.open_project == true) {
-					return true
-				}
-				return false
-			},
-		}
-
-		feedbacks['recording_status'] = {
-			type: 'boolean',
-			name: 'Unit is Recording',
-			description: 'Show feedback for recording state',
-			options: [
-			],
-			defaultStyle: {
-				color: combineRgb(0, 0, 0),
-				bgcolor: combineRgb(255, 0, 0)
-			},
-			callback: async (event) => {
-				let opt = await event.options
-				if (this.data.recording_status == true) {
-					return true
-				}
-				return false
-			},
-		}
-
-		feedbacks['playback_status'] = {
-			type: 'boolean',
-			name: 'Unit is in Selected Playback State',
-			description: 'Show feedback for playback state',
-			options: [
-				{
-					type: 'dropdown',
-					label: 'Playback Status',
-					id: 'status',
-					default: 1,
-					choices: [
-						{ id: 0,  label: 'Playback Paused'},
-						{ id: 1,  label: 'Playing Back'},
-						{ id: 2,  label: 'Playing Back Clip'},
-						{ id: 3,  label: 'Playing Back Playlist'}
-					]
+		let feedbacks = {
+			project_open: {
+				type: 'boolean',
+				name: 'Unit has an Open Project',
+				description: 'Show feedback for Open Project state',
+				options: [
+				],
+				defaultStyle: {
+					color: combineRgb(255, 255, 255),
+					bgcolor: combineRgb(0, 0, 255)
 				},
-			],
-			defaultStyle: {
-				color: combineRgb(0, 0, 0),
-				bgcolor: combineRgb(255, 0, 0)
+				callback: (event) => {
+					if (this.data.project_open == true) {
+						return true
+					}
+					return false
+				},
 			},
-			callback: async (event) => {
-				let opt = await event.options
-				if (this.data.playback_status == true) {
-					return true
+			recording: {
+				type: 'boolean',
+				name: 'Unit is Recording',
+				description: 'Show feedback for recording state',
+				options: [
+				],
+				defaultStyle: {
+					color: combineRgb(255, 255, 255),
+					bgcolor: combineRgb(255, 0, 0)
+				},
+				callback: (event) => {
+					if (this.data.recording) {
+						return true
+					}
+					return false
+				},
+			},
+			playing: {
+				type: 'boolean',
+				name: 'Unit is Playing',
+				description: 'Show feedback for playback state',
+				options: [
+				],
+				defaultStyle: {
+					color: combineRgb(255, 255, 255),
+					bgcolor: combineRgb(255, 0, 0)
+				},
+				callback: (event) => {
+					if (this.data.playing) {
+						return true
+					}
+					return false
+				},
+			},
+			playback_range: {
+				type: 'boolean',
+				name: 'SPEED RANGE is enabled',
+				description: 'Show feedback if SPEED RANGE is enabled',
+				options: [
+				],
+				defaultStyle: {
+					color: combineRgb(255, 255, 255),
+					bgcolor: combineRgb(255, 0, 0)
+				},
+				callback: (event) => {
+					if (this.data.playback_range == true) {
+						return true
+					}
+					return false
+				},
+			},
+			in_point: {
+				type: 'boolean',
+				name: 'In Point is Set',
+				description: 'Show feedback for In Point Set state',
+				options: [
+				],
+				defaultStyle: {
+					color: combineRgb(255, 255, 255),
+					bgcolor: combineRgb(255, 0, 0)
+				},
+				callback: (event) => {
+					if (this.data.in_point) {
+						return true
+					}
+					return false
+				},
+			},
+			in_out_config: {
+				type: 'boolean',
+				name: 'Unit in/out config',
+				description: 'Show feedback for input/output config',
+				options: [
+					{
+						id: 'in',
+						type: 'dropdown',
+						label: 'Input',
+						default: 1,
+						choices: [
+							{id: -1, label: 'Ignore'},
+							{id: 1, label: 'Live 1'},
+							{id: 2, label: 'Live 2'},
+							{id: 3, label: 'PinP'},
+							{id: 4, label: 'Split'}
+						]
+					},
+					{
+						id: 'out',
+						type: 'dropdown',
+						label: 'Output',
+						default: '0',
+						choices: [
+							{id: -1, label: 'Ignore'},
+							{id: 0, label: 'Replay'},
+							{id: 1, label: 'Live'},
+						]
+					}
+				],
+				defaultStyle: {
+					color: combineRgb(255, 255, 255),
+					bgcolor: combineRgb(255, 0, 0)
+				},
+				callback: (event) => {
+					if (event.options.in == -1) {
+						if (event.options.out == this.data.out_config) {
+							return true
+						}
+					}
+					else if (event.options.out == -1) {
+						if (event.options.in == this.data.in_config) {
+							return true
+						}
+					}
+					else if (event.options.in == this.data.in_config && event.options.out == this.data.out_config) {
+						return true
+					}
+					return false
 				}
-				return false
 			},
-		}
-
-		feedbacks['playback_range'] = {
-			type: 'boolean',
-			name: 'SPEED RANGE is Lit',
-			description: 'Show feedback for SPEED RANGE button state',
-			options: [
-			],
-			defaultStyle: {
-				color: combineRgb(0, 0, 0),
-				bgcolor: combineRgb(255, 0, 0)
-			},
-			callback: async (event) => {
-				let opt = await event.options
-				if (this.data.playback_range == true) {
-					return true
+			clip_selected: {
+				type: 'boolean',
+				name: 'Clip is selected',
+				description: 'Show feedback if a clip from a playlist is selected',
+				options: [
+					{
+						id: 'playlist',
+						type: 'dropdown',
+						label: 'Playlist',
+						default: -1,
+						choices: [
+							{id: -1, label: 'Selected'},
+							{id: 0, label: 'Clip List'},
+							{id: 1, label: 'Palette 1'},
+							{id: 2, label: 'Palette 2'},
+							{id: 3, label: 'Palette 3'},
+							{id: 4, label: 'Palette 4'},
+							{id: 5, label: 'Palette 5'},
+							{id: 6, label: 'Palette 6'},
+							{id: 7, label: 'Palette 7'},
+							{id: 8, label: 'Palette 8'},
+						]
+					},
+					{
+						id: 'number',
+						type: 'number',
+						label: 'Number (0 = selected clip)',
+						default: 1,
+						min: 0,
+						max: 512
+					}
+				],
+				defaultStyle: {
+					color: combineRgb(0, 0, 0),
+					bgcolor: combineRgb(0, 255, 0)
+				},
+				callback: (event) => {
+					let playlist = event.options.playlist
+					let number = event.options.number
+					if (event.options.playlist == -1) {
+						playlist = this.data.selected_playlist
+					}
+					if (event.options.number == 0) {
+						number = this.data.selected_number
+					}
+					if (this.data.selected_playlist == playlist && this.data.selected_number == number) {
+						return true
+					}
+					return false
 				}
-				return false
 			},
-		}
-
-		feedbacks['in_point_status'] = {
-			type: 'boolean',
-			name: 'In Point is Set',
-			description: 'Show feedback for In Point Set state',
-			options: [
-			],
-			defaultStyle: {
-				color: combineRgb(0, 0, 0),
-				bgcolor: combineRgb(255, 0, 0)
-			},
-			callback: async (event) => {
-				let opt = await event.options
-				if (this.data.in_point_status == true) {
-					return true
+			clip_cued: {
+				type: 'boolean',
+				name: 'Clip is cued-up',
+				description: 'Show feedback if a clip from a playlist is cued-up',
+				options: [
+					{
+						id: 'playlist',
+						type: 'dropdown',
+						label: 'Playlist',
+						default: -1,
+						choices: [
+							{id: -1, label: 'Selected'},
+							{id: 0, label: 'Clip List'},
+							{id: 1, label: 'Palette 1'},
+							{id: 2, label: 'Palette 2'},
+							{id: 3, label: 'Palette 3'},
+							{id: 4, label: 'Palette 4'},
+							{id: 5, label: 'Palette 5'},
+							{id: 6, label: 'Palette 6'},
+							{id: 7, label: 'Palette 7'},
+							{id: 8, label: 'Palette 8'},
+						]
+					},
+					{
+						id: 'number',
+						type: 'number',
+						label: 'Number (0 = selected clip)',
+						default: 1,
+						min: 0,
+						max: 512
+					}
+				],
+				defaultStyle: {
+					color: combineRgb(255, 255, 255),
+					bgcolor: combineRgb(255, 0, 0)
+				},
+				callback: (event) => {
+					let playlist = event.options.playlist
+					let number = event.options.number
+					if (playlist == -1) {
+						playlist = this.data.selected_playlist
+					}
+					if (number == 0) {
+						number = this.data.selected_number
+					}
+					if (this.data.cued_playlist == playlist && this.data.cued_number == number) {
+						return true
+					}
+					return false
 				}
-				return false
 			},
+			clip_available: {
+				type: 'boolean',
+				name: 'Clip is available',
+				description: 'Show feedback if a clip from the selected playlist is available',
+				options: [
+					{
+						id: 'number',
+						type: 'number',
+						label: 'Number',
+						default: 1,
+						min: 1,
+						max: 512
+					}
+				],
+				defaultStyle: {
+					color: combineRgb(255, 255, 255),
+					bgcolor: combineRgb(0, 0, 51)
+				},
+				callback: (event) => {
+					if (event.options.number <= this.data.selected_playlist_length) {
+						return true
+					}
+					return false
+				}
+			},
+			playlist_selected: {
+				type: 'boolean',
+				name: 'Playlist is selected',
+				description: 'Show feedback if a playlist is selected',
+				options: [
+					{
+						id: 'playlist',
+						type: 'dropdown',
+						label: 'Playlist',
+						default: 0,
+						choices: [
+							{id: 0, label: 'Clip List'},
+							{id: 1, label: 'Palette 1'},
+							{id: 2, label: 'Palette 2'},
+							{id: 3, label: 'Palette 3'},
+							{id: 4, label: 'Palette 4'},
+							{id: 5, label: 'Palette 5'},
+							{id: 6, label: 'Palette 6'},
+							{id: 7, label: 'Palette 7'},
+							{id: 8, label: 'Palette 8'},
+						]
+					}
+				],
+				defaultStyle: {
+					color: combineRgb(255, 255, 255),
+					bgcolor: combineRgb(255, 0, 255)
+				},
+				callback: (event) => {
+					if (this.data.selected_playlist == event.options.playlist) {
+						return true
+					}
+					return false
+				}
+			}
 		}
 
 		this.setFeedbackDefinitions(feedbacks)
@@ -1061,47 +1409,649 @@ class p20hdInstance extends InstanceBase {
 	initVariables() {
 		let variables = []
 
-		variables.push({ variableId: 'product', name: 'Product Name' })
-		variables.push({ variableId: 'version', name: 'Version' })
-		variables.push({ variableId: 'open_project', name: 'Open Project' })
-		variables.push({ variableId: 'project_mode', name: 'Project Mode' })
-		variables.push({ variableId: 'recording_status', name: 'Recording Status' })
-		variables.push({ variableId: 'playback_status', name: 'Playback Status' })
-		variables.push({ variableId: 'playback_speed', name: 'Playback Speed' })
-		variables.push({ variableId: 'playback_range', name: 'Playback Range' })
-		variables.push({ variableId: 'in_point_status', name: 'In Point Status' })
-		variables.push({ variableId: 'input_selection_status', name: 'Input Selection Status' })
-		variables.push({ variableId: 'output_selection_status', name: 'Output Selection Status' })
-		variables.push({ variableId: 'audio_level', name: 'Audio Level' })
-		variables.push({ variableId: 'playlist_selected_clip', name: 'Playlist Containing Selected Clip' })
-		variables.push({ variableId: 'playlist_selected_clip_number', name: 'Number of Currently Selected Clip' })
-		variables.push({ variableId: 'playlist_queued_clip', name: 'Playlist Containing Queued Clip' })
-		variables.push({ variableId: 'playlist_queued_clip_number', name: 'Number of Currently Queued Clip' })
+		variables.push({variableId: 'product', name: 'Product Name'})
+		variables.push({variableId: 'version', name: 'Version'})
+		variables.push({variableId: 'project_open', name: 'Project Open'})
+		variables.push({variableId: 'project_mode', name: 'Project Mode'})
+		variables.push({variableId: 'recording', name: 'Recording'})
+		variables.push({variableId: 'recording_label', name: 'Recording Label'})
+		variables.push({variableId: 'playing', name: 'Playing'})
+		variables.push({variableId: 'playing_label', name: 'Playing Label'})
+		variables.push({variableId: 'playback_speed', name: 'Playback Speed'})
+		variables.push({variableId: 'playback_range', name: 'Playback Range'})
+		variables.push({variableId: 'in_point', name: 'In Point'})
+		variables.push({variableId: 'input_selection_status', name: 'Input Selection Status'})
+		variables.push({variableId: 'output_selection_status', name: 'Output Selection Status'})
+		variables.push({variableId: 'audio_level', name: 'Audio Level'})
+		variables.push({variableId: 'selected_clip_playlist', name: 'Playlist Containing Selected Clip'})
+		variables.push({variableId: 'selected_clip_playlist_length', name: 'Number Of Clips In Playlist Containing Selected Clip'})
+		variables.push({variableId: 'selected_clip_number', name: 'Number of Currently Selected Clip'})
+		variables.push({variableId: 'cued_clip_playlist', name: 'Playlist Containing Cued-Up Clip'})
+		variables.push({variableId: 'cued_clip_number', name: 'Number of Currently Cued-Up Clip'})
 
 		this.setVariableDefinitions(variables)
 
 		this.setVariableValues({
 			product: '',
 			version: '',
-			open_project: '',
+			project_open: false,
 			project_mode: '',
-			recording_status: '',
-			playback_status: '',
-			playback_speed: '',
+			recording: false,
+			recording_label: 'Rec',
+			playing: false,
+			playing_label: 'Play',
+			playback_speed: 0,
 			playback_range: '',
-			in_point_status: '',
+			in_point: false,
 			input_selection_status: '',
 			output_selection_status: '',
-			audio_level: '',
-			playlist_selected_clip: '',
-			playlist_selected_clip_number: '',
-			playlist_queued_clip: '',
-			playlist_queued_clip_number: ''
+			audio_level: '-INF',
+			selected_clip_playlist: '',
+			selected_clip_playlist_length: 0,
+			selected_clip_number: '',
+			cued_clip_playlist: '',
+			cued_clip_number: '',
 		})
 	}
 
 	initPresets() {
-		let presets = []
+		let presets = [
+			{
+				category: 'Control',
+				name: 'Play/Pause',
+				type: 'button',
+				style: {
+					text: '$(p20:playing_label)',
+					size: '24',
+					color: combineRgb(255,255,255),
+					bgcolor: combineRgb(51,0,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'playback',
+								options: {mode: 'TOG'}
+							}
+						]
+					}
+				],
+				feedbacks: [
+					{
+						feedbackId: 'playing',
+						style: {
+							color: combineRgb(255, 255, 255),
+							bgcolor: combineRgb(255, 0, 0)
+						}
+					}
+				]
+			},
+			{
+				category: 'Control',
+				name: 'Recording Start/Stop',
+				type: 'button',
+				style: {
+					text: '$(p20:recording_label)',
+					size: '24',
+					color: combineRgb(255,255,255),
+					bgcolor: combineRgb(51,0,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'recording',
+								options: {mode: 'TOG'}
+							}
+						]
+					}
+				],
+				feedbacks: [
+					{
+						feedbackId: 'recording',
+						style: {
+							color: combineRgb(255, 255, 255),
+							bgcolor: combineRgb(255, 0, 0)
+						}
+					}
+				]
+			},
+			// {id: 'JNB', label: 'Next Bookmark'},
+			// {id: 'JPB', label: 'Previous Bookmark'},
+			// {id: 'JTP', label: 'Beginning'},
+			// {id: 'JED', label: 'End'},
+			{
+				category: 'Control',
+				name: 'Jump To Beginning',
+				type: 'button',
+				style: {
+					text: 'Start',
+					size: '24',
+					color: combineRgb(0,0,0),
+					bgcolor: combineRgb(255,255,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'timeline',
+								options: {setting: 'JTP'}
+							}
+						]
+					}
+				],
+				feedbacks: []
+			},
+			{
+				category: 'Control',
+				name: 'Jump To Previous Bookmark',
+				type: 'button',
+				style: {
+					text: 'I<',
+					size: '24',
+					color: combineRgb(0,0,0),
+					bgcolor: combineRgb(255,255,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'timeline',
+								options: {setting: 'JPB'}
+							}
+						]
+					}
+				],
+				feedbacks: []
+			},
+			{
+				category: 'Control',
+				name: 'Shuttle Reverse x2',
+				type: 'button',
+				style: {
+					text: '<<',
+					size: '24',
+					color: combineRgb(0,0,0),
+					bgcolor: combineRgb(255,255,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'shuttle',
+								options: {direction: 'rev', speed: 2}
+							}
+						],
+						up: [
+							{
+								actionId: 'playback',
+								options: {mode: 'PUS'}
+							}
+						]
+					}
+				],
+				feedbacks: []
+			},
+			{
+				category: 'Control',
+				name: 'Shuttle Reverse x1',
+				type: 'button',
+				style: {
+					text: '<',
+					size: '24',
+					color: combineRgb(0,0,0),
+					bgcolor: combineRgb(255,255,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'shuttle',
+								options: {direction: 'rev', speed: 1}
+							}
+						],
+						up: [
+							{
+								actionId: 'playback',
+								options: {mode: 'PUS'}
+							}
+						]
+					}
+				],
+				feedbacks: []
+			},
+			{
+				category: 'Control',
+				name: 'Jog To Previous Frame',
+				type: 'button',
+				style: {
+					text: '-1',
+					size: '24',
+					color: combineRgb(0,0,0),
+					bgcolor: combineRgb(255,255,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'jog',
+								options: {direction: -1}
+							}
+						]
+					}
+				],
+				feedbacks: []
+			},
+			{
+				category: 'Control',
+				name: 'Jog To Next Frame',
+				type: 'button',
+				style: {
+					text: '+1',
+					size: '24',
+					color: combineRgb(0,0,0),
+					bgcolor: combineRgb(255,255,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'jog',
+								options: {direction: 1}
+							}
+						]
+					}
+				],
+				feedbacks: []
+			},
+			{
+				category: 'Control',
+				name: 'Shuttle Forward x1',
+				type: 'button',
+				style: {
+					text: '>',
+					size: '24',
+					color: combineRgb(0,0,0),
+					bgcolor: combineRgb(255,255,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'shuttle',
+								options: {direction: 'for', speed: 1}
+							}
+						],
+						up: [
+							{
+								actionId: 'playback',
+								options: {mode: 'PUS'}
+							}
+						]
+					}
+				],
+				feedbacks: []
+			},
+			{
+				category: 'Control',
+				name: 'Shuttle Forward x2',
+				type: 'button',
+				style: {
+					text: '>>',
+					size: '24',
+					color: combineRgb(0,0,0),
+					bgcolor: combineRgb(255,255,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'shuttle',
+								options: {direction: 'for', speed: 2}
+							}
+						],
+						up: [
+							{
+								actionId: 'playback',
+								options: {mode: 'PUS'}
+							}
+						]
+					}
+				],
+				feedbacks: []
+			},
+			{
+				category: 'Control',
+				name: 'Jump To Next Bookmark',
+				type: 'button',
+				style: {
+					text: '>I',
+					size: '24',
+					color: combineRgb(0,0,0),
+					bgcolor: combineRgb(255,255,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'timeline',
+								options: {setting: 'JNB'}
+							}
+						]
+					}
+				],
+				feedbacks: []
+			},
+			{
+				category: 'Control',
+				name: 'Jump To End',
+				type: 'button',
+				style: {
+					text: 'End',
+					size: '24',
+					color: combineRgb(0,0,0),
+					bgcolor: combineRgb(255,255,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'timeline',
+								options: {setting: 'JED'}
+							}
+						]
+					}
+				],
+				feedbacks: []
+			},
+			{
+				category: 'Clips',
+				name: 'Create Clip From Output',
+				type: 'button',
+				style: {
+					text: 'New\n(OUT)',
+					size: '24',
+					color: combineRgb(255,255,255),
+					bgcolor: combineRgb(255,0,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'clip_create',
+								options: {setting: -1}
+							}
+						]
+					}
+				],
+				feedbacks: []
+			},
+			{
+				category: 'Clips',
+				name: 'Create Clip From Replay',
+				type: 'button',
+				style: {
+					text: 'New\n(RPL)',
+					size: '24',
+					color: combineRgb(255,255,255),
+					bgcolor: combineRgb(255,0,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'clip_create',
+								options: {setting: 0}
+							}
+						]
+					}
+				],
+				feedbacks: []
+			},
+			{
+				category: 'Clips',
+				name: 'Create Clip From Live',
+				type: 'button',
+				style: {
+					text: 'New\n(LIVE)',
+					size: '24',
+					color: combineRgb(255,255,255),
+					bgcolor: combineRgb(255,0,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'clip_create',
+								options: {setting: 1}
+							}
+						]
+					}
+				],
+				feedbacks: []
+			},
+			{
+				category: 'Clips',
+				name: 'Cue Selected Clip',
+				type: 'button',
+				style: {
+					text: 'Cue',
+					size: '24',
+					color: combineRgb(255,255,255),
+					bgcolor: combineRgb(51,0,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'clip_actions',
+								options: {action: 'CLQ', number: 0}
+							}
+						]
+					}
+				],
+				feedbacks: [
+					{
+						feedbackId: 'clip_cued',
+						options: {playlist: -1, number: 0},
+						style: {
+							color: combineRgb(255, 255, 255),
+							bgcolor: combineRgb(255, 0, 0)
+						}
+					},
+				]
+			},
+			{
+				category: 'Clips',
+				name: 'Delete Selected Clip',
+				type: 'button',
+				style: {
+					text: 'Del',
+					size: '24',
+					color: combineRgb(255,255,255),
+					bgcolor: combineRgb(51,0,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'clip_actions',
+								options: {action: 'CLD', number: 0}
+							}
+						]
+					}
+				],
+				feedbacks: [
+					{
+						feedbackId: 'clip_cued',
+						options: {playlist: -1, number: 0},
+						style: {
+							color: combineRgb(255, 255, 255),
+							bgcolor: combineRgb(255, 0, 0)
+						}
+					},
+				]
+			}
+		]
+
+		for (let i = 1; i <= 64; i++) {
+			presets.push({
+				category: 'Clips',
+				name: 'Select Clip ' + i,
+				type: 'button',
+				style: {
+					text: 'Clip\n' + i,
+					size: '18',
+					color: combineRgb(255,255,255),
+					bgcolor: combineRgb(0,0,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'clip_actions',
+								options: {action: 'CLS', number: i}
+							},
+						]
+					}
+				],
+				feedbacks: [
+					{
+						feedbackId: 'clip_available',
+						options: {number: i},
+						style: {
+							color: combineRgb(255, 255, 255),
+							bgcolor: combineRgb(0, 0, 51)
+						},
+					},
+					{
+						feedbackId: 'clip_selected',
+						options: {playlist: -1, number: i},
+						style: {
+							color: combineRgb(0, 0, 0),
+							bgcolor: combineRgb(0, 255, 0)
+						}
+					},
+					{
+						feedbackId: 'clip_cued',
+						options: {playlist: -1, number: i},
+						style: {
+							color: combineRgb(255, 255, 255),
+							bgcolor: combineRgb(255, 0, 0)
+						}
+					},
+				]
+			})
+		}
+
+		presets.push(
+			{
+				category: 'Speed',
+				name: 'Show Speed',
+				type: 'button',
+				style: {
+					text: 'Speed:\n$(p20:playback_speed)',
+					size: '18',
+					color: combineRgb(255,255,255),
+					bgcolor: combineRgb(0,0,0)
+				},
+				steps: [],
+				feedbacks: []
+			}
+		)
+
+		for (let m = 0; m <= 1; m++) {
+			let name
+			let text
+			let bg
+			let play
+			if (m == 0) {
+				name = 'Start Playback At '
+				text = 'Play'
+				bg = combineRgb(51,0,0)
+				play = true
+			}
+			else {
+				name = 'Set Playback To '
+				text = 'Set'
+				bg = combineRgb(0,0,51)
+				play = false
+			}
+
+			for (let n = 80; n >= 25; n-=5) {
+				let i
+				if (n == 80) {i = 100} else {i = n}
+				presets.push({
+					category: 'Speed',
+					name: name + i + '% Speed',
+					type: 'button',
+					style: {
+						text: text + '\n' + i + '%',
+						size: '24',
+						color: combineRgb(255,255,255),
+						bgcolor: bg
+					},
+					steps: [
+						{
+							down: [
+								{
+									actionId: 'playback_speed',
+									options: {mode: 'set', speed: i, play: play, limit: true}
+								},
+							]
+						}
+					],
+					feedbacks: []
+				})
+			}
+		}
+
+		presets.push(
+			{
+				category: 'Speed',
+				name: 'Decrease Speed by 5%',
+				type: 'button',
+				style: {
+					text: 'Speed\n-5%',
+					size: '18',
+					color: combineRgb(255,255,255),
+					bgcolor: combineRgb(255,0,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'playback_speed',
+								options: {mode: 'dec', speed: 5, play: false, limit: true}
+							}
+						]
+					}
+				],
+				feedbacks: []
+			},
+			{
+				category: 'Speed',
+				name: 'Increase Speed by 5%',
+				type: 'button',
+				style: {
+					text: 'Speed\n+5%',
+					size: '18',
+					color: combineRgb(255,255,255),
+					bgcolor: combineRgb(255,0,0)
+				},
+				steps: [
+					{
+						down: [
+							{
+								actionId: 'playback_speed',
+								options: {mode: 'inc', speed: 5, play: false, limit: true}
+							}
+						]
+					}
+				],
+				feedbacks: []
+			}
+		)
 
 		this.setPresetDefinitions(presets)
 	}
