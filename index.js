@@ -76,7 +76,6 @@ class p20hdInstance extends InstanceBase {
 		this.initFeedbacks()
 		this.initVariables()
 		this.initPresets()
-
 		this.init_tcp()
 	}
 
