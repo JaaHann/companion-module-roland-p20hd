@@ -181,7 +181,6 @@ class p20hdInstance extends InstanceBase {
 				}
 			}
 		}
-
 		return return_cmd
 	}
 
