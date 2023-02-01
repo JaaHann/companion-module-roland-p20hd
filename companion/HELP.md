@@ -3,7 +3,7 @@
 This module will allow you to control a Roland P-20HD.
 
 You need to get the IP address of the device - Menu (3/3) > LAN (1/3) > IP Setting<br>
-Set up the User Account with an User ID and Password - Menu (3/3) > LAN (2/3) > User ID & Password<br>
+Set up the User Account with a User ID and Password - Menu (3/3) > LAN (2/3) > User ID & Password<br>
 Enable Remote Control - Menu (3/3) > LAN (3/3) > Remote Control > ON
 
 IMPORTANT: If the User ID or Password is empty (they are empty by default or after resetting), the device won't accept a remote connection.<br>
@@ -17,32 +17,36 @@ If you are using DHCP to auto-assign an IP address, it's best practice to boot t
 **Available Actions:**
 * Start/Stop Recording
 * Play/Pause
-* Jog Forward/Reverse
+* Jog
 * Shuttle
-* Change Playback Speed
-* Toggle Speed Range
+* Set Playback Speed
 * Set IN/OUT Point
-* Clip Control - Create, Select, Playback Start, Cue Up, Delete
-* Bookmark - Set/Delete
-* Switch Input/Output
-* Jump to Next/Previous Bookmark
-* Timeline - Jump to Beginning/End
-* Playlist - Select, Playback Start
-* Auto-play Stop
-* Palette - Select, Add Current Clip
-* Still Image Clips - Select, Stop
-* Audio Clips - Playback, Stop
-* Set Audio Level
+* Speed Range ON/OFF
+* Create Clip
+* Clip Actions (Select, Cue, Delete)
+* Add Current Clip to Palette
+* Play Selected Clip
+* Create/Delete Bookmarks
+* Jump to Markers in Timeline
+* Select Playlist
+* Start/Stop Autoplay of selected Playlist
+* Start/Stop Still Image
+* Start/Stop Audio Clip
+* Audio Level
+* Switch Input
+* Switch Output
 * Request Active Sensing
-* Shutdown Unit
+* Shut down this Unit
 
 **Available Feedbacks:**
+* Audio Clip is available
 * Clip is available
 * Clip is cued-up
 * Clip is selected
 * In Point is Set
 * Playlist is selected
 * SPEED RANGE is enabled
+* Still Image is available
 * Unit has an Open Project
 * Unit in/out config
 * Unit is Playing
@@ -58,11 +62,9 @@ If you are using DHCP to auto-assign an IP address, it's best practice to boot t
 * Playback Range
 * Playback Speed
 * Playing
-* Playing Label
 * Product Name
 * Project Mode
 * Recording
-* Recording Label
 * Number of Currently Selected Clip
 * Playlist Containing Selected Clip
 * Number Of Clips In Playlist Containing Selected Clip
