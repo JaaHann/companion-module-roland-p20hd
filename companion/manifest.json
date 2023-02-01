@@ -3,7 +3,7 @@
 	"name": "roland-p20hd",
 	"shortname": "p20",
 	"description": "P-20HD",
-	"version": "1.0.4",
+	"version": "1.0.5",
 	"license": "MIT",
 	"repository": "git+https://github.com/bitfocus/companion-module-roland-p20hd.git",
 	"bugs": "https://github.com/bitfocus/companion-module-roland-p20hd/issues",
